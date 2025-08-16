@@ -163,21 +163,20 @@ class DualEncoder(nn.Module):
         self.phrase_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, out))
         self.context_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, out))
 
-        self.tok = AbsTokenizer()
-
     @torch.no_grad()
     def _embed_segment(self, pm: pretty_midi.PrettyMIDI) -> torch.Tensor:
-        ids, mask = self.tok.encode_pretty_midi(pm)
-        if not ids or not any(mask):
-            return torch.zeros(512, device=self.device)  # or skip earlier in collate
-        input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
-        attention_mask = torch.tensor([mask], dtype=torch.long, device=self.device)
-        seq = self.aria(input_ids=input_ids, attention_mask=attention_mask)
-        if isinstance(seq, (tuple, list)):
-            seq = seq[0]
-        m = attention_mask.unsqueeze(-1).float()
-        pooled = (seq * m).sum(1) / m.sum(1).clamp(min=1e-6)
-        return pooled.squeeze(0).float()   # (D,)
+        # write to a temp file and use aria.embeddings helper
+        with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
+            pm.write(tmp.name)
+            emb = get_global_embedding_from_midi(
+                model=self.aria,
+                midi_path=tmp.name,
+                device=str(self.device) if self.device.type == "cuda" else "cpu"
+            )
+        # ensure torch tensor on device
+        if not isinstance(emb, torch.Tensor):
+            emb = torch.tensor(emb)
+        return emb.to(self.device).float()
 
     def forward(self, batch_segments: List[Tuple[pretty_midi.PrettyMIDI, pretty_midi.PrettyMIDI]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
