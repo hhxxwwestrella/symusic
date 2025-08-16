@@ -263,34 +263,39 @@ def train(args):
                     num_workers=args.num_workers, collate_fn=collate, drop_last=True, pin_memory=True)
 
     model.train()
+    out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     global_step = 0
-    for epoch in range(args.epochs):
-        pbar = tqdm(dl, desc=f"Epoch {epoch+1}/{args.epochs}", ncols=100)
-        for batch_segments in pbar:
-            if len(batch_segments) < args.batch_size:
-                continue
-            zp, zc = model(batch_segments)
-            loss = clip_loss(zp, zc, temperature=args.temp)
+    try:
+        for epoch in range(args.epochs):
+            pbar = tqdm(dl, desc=f"Epoch {epoch+1}/{args.epochs}", ncols=100)
+            for batch_segments in pbar:
+                if len(batch_segments) < args.batch_size:
+                    continue
+                zp, zc = model(batch_segments)
+                loss = clip_loss(zp, zc, temperature=args.temp)
 
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(list(model.phrase_head.parameters()) + list(model.context_head.parameters()), max_norm=1.0)
-            opt.step()
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(list(model.phrase_head.parameters()) + list(model.context_head.parameters()), max_norm=1.0)
+                opt.step()
 
-            global_step += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+                global_step += 1
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # save projection heads (backbone is frozen)
-        out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "phrase_head": model.phrase_head.state_dict(),
-            "context_head": model.context_head.state_dict(),
-            "base_dim": next(model.phrase_head.parameters()).shape[1],
-            "proj_dim": model.phrase_head[-1].out_features,
-            "k_bars": args.k_bars
-        }, out / f"proj_heads_epoch{epoch+1}.pt")
-    print("Done.")
-
+            # save projection heads (backbone is frozen)
+            out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "phrase_head": model.phrase_head.state_dict(),
+                "context_head": model.context_head.state_dict(),
+                "base_dim": next(model.phrase_head.parameters()).shape[1],
+                "proj_dim": model.phrase_head[-1].out_features,
+                "k_bars": args.k_bars
+            }, out / f"proj_heads_epoch{epoch+1}.pt")
+        print("Done.")
+    except KeyboardInterrupt:
+        print("\nInterrupted — saving last checkpoint to proj_heads_last.pt ...")
+        _save_heads(model, out, "last", args.k_bars)
+        raise        
 # -----------------------------
 # Encoding contexts for indexing
 # -----------------------------
@@ -635,6 +640,17 @@ def _aria_forward(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
             "Tried (ids,mask), (ids), and (x=,mask=)."
         ) from e
 
+def _save_heads(model, out_dir: Path, tag: str, k_bars: int):
+    """Save projection heads with dimensions; backbone is frozen and not saved."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "phrase_head": model.phrase_head.state_dict(),
+        "context_head": model.context_head.state_dict(),
+        "base_dim": next(model.phrase_head.parameters()).shape[1],
+        "proj_dim": model.phrase_head[-1].out_features,
+        "k_bars": k_bars
+    }, out_dir / f"proj_heads_{tag}.pt")
+    
 # -----------------------------
 # CLI
 # -----------------------------
