@@ -29,7 +29,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 # --- Aria embedding backbone ---
-from aria.embedding import get_global_embedding_from_midi  # public helper
 from aria.model import TransformerEMB, ModelConfig
 from aria.config import load_model_config
 from ariautils.tokenizer import AbsTokenizer
@@ -159,20 +158,21 @@ class DualEncoder(nn.Module):
         self.phrase_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, out))
         self.context_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, out))
 
+        self.tok = AbsTokenizer() in DualEncoder.__init__
+
     @torch.no_grad()
     def _embed_segment(self, pm: pretty_midi.PrettyMIDI) -> torch.Tensor:
-        # write to a temp file and use aria.embeddings helper
-        with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
-            pm.write(tmp.name)
-            emb = get_global_embedding_from_midi(
-                model=self.aria,
-                midi_path=tmp.name,
-                device=str(self.device) if self.device.type == "cuda" else "cpu"
-            )
-        # ensure torch tensor on device
-        if not isinstance(emb, torch.Tensor):
-            emb = torch.tensor(emb)
-        return emb.to(self.device).float()
+        ids, mask = self.tok.encode_pretty_midi(pm)
+        if not ids or not any(mask):
+            return torch.zeros(512, device=self.device)  # or skip earlier in collate
+        input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor([mask], dtype=torch.long, device=self.device)
+        seq = self.aria(input_ids=input_ids, attention_mask=attention_mask)
+        if isinstance(seq, (tuple, list)):
+            seq = seq[0]
+        m = attention_mask.unsqueeze(-1).float()
+        pooled = (seq * m).sum(1) / m.sum(1).clamp(min=1e-6)
+        return pooled.squeeze(0).float()   # (D,)
 
     def forward(self, batch_segments: List[Tuple[pretty_midi.PrettyMIDI, pretty_midi.PrettyMIDI]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -305,10 +305,29 @@ def encode_contexts(args):
 
     # projection heads
     ckpt = torch.load(args.proj_ckpt, map_location=args.device)
-    base_dim = ckpt["base_dim"]; proj_dim = ckpt["proj_dim"]
-    hid = 512
-    context_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, proj_dim)).to(args.device)
-    context_head.load_state_dict(ckpt["context_head"]); context_head.eval()
+
+    def _build_head_from_state_dict(head_sd: dict):
+        w1 = head_sd['0.weight']  # (hid, base_dim)
+        w2 = head_sd['2.weight']  # (proj_dim, hid)
+        base_dim = w1.shape[1]
+        hid      = w1.shape[0]
+        proj_dim = w2.shape[0]
+        head = nn.Sequential(
+            nn.Linear(base_dim, hid),
+            nn.ReLU(),
+            nn.Linear(hid, proj_dim)
+        ).to(args.device)
+        head.load_state_dict(head_sd)
+        head.eval()
+        return head, base_dim, hid, proj_dim
+
+    if 'context_head' in ckpt:
+        context_head, base_dim, hid, proj_dim = _build_head_from_state_dict(ckpt['context_head'])
+    else:
+        # adjust key if your ckpt uses a different one
+        context_head, base_dim, hid, proj_dim = _build_head_from_state_dict(ckpt['head'])
+
+    print(f"[encode] head dims: base={base_dim}, hid={hid}, proj={proj_dim}")    
 
     midi_root = Path(args.midi_root)
     midi_files = (list(midi_root.rglob("*.mid")) +
@@ -323,6 +342,7 @@ def encode_contexts(args):
     vec_path = out_dir / "contexts.f32.npy"
 
     all_vecs = []
+    tok = AbsTokenizer()
     with open(meta_path, "w", encoding="utf-8") as wf:
         for mf in tqdm(midi_files, desc="Encoding contexts"):
             try:
@@ -331,18 +351,28 @@ def encode_contexts(args):
                 for i in range(args.k_bars, len(db) - 4):
                     cs, ce = db[i - args.k_bars], db[i]
                     pm_ctx = slice_midi(pm, cs, ce)
-                    with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
-                        pm_ctx.write(tmp.name)
-                        base = get_global_embedding_from_midi(aria, tmp.name, device=args.device)
-                    if not isinstance(base, torch.Tensor):
-                        base = torch.tensor(base)
-                    z = context_head(base.to(args.device).float()[None, ...])  # (1,D)
-                    z = nn.functional.normalize(z, p=2, dim=1)
-                    all_vecs.append(z.squeeze(0).cpu().numpy().astype("float32"))
-                    wf.write(f"{mf}\t{i-args.k_bars}\t{i}\n")
+                    if (not pm_ctx.instruments) or all(len(i.notes) == 0 for i in pm_ctx.instruments):
+                        continue
+                    vec = embed_pm_segment(
+                        pm_seg=pm_ctx,
+                        tok=tok,
+                        aria_model=aria,
+                        proj_head=context_head,
+                        device=args.device,
+                        skip_if_empty=True,    # returns None if tokenization yields nothing
+                    )
+                    if vec is None:
+                        continue  # empty after tokenization/masking
+                    all_vecs.append(vec)
+                    wf.write(f"{mf}\t{i-args.k_bars}\t{i}\n")   # write metadata only if we appended
             except Exception:
+                if os.environ.get("ENC_DEBUG"):
+                    import traceback; traceback.print_exc()
                 continue
 
+    if not all_vecs:
+        print("No context vectors produced. Try lowering --k-bars or enable ENC_DEBUG=1 for tracebacks.")
+        return            
     arr = np.vstack(all_vecs).astype("float32")
     np.save(vec_path, arr)
     print(f"Wrote {arr.shape} vectors to {vec_path} and metadata to {meta_path}")
@@ -353,6 +383,8 @@ def encode_contexts(args):
 @torch.no_grad()
 def query(args):
     import faiss
+
+    tok = AbsTokenizer()
 
     # load indexable vectors
     vecs = np.load(Path(args.index_dir) / "contexts.f32.npy")
@@ -386,22 +418,220 @@ def query(args):
     ps, pe = db[i0], db[i0 + 4]
     pm_phr = slice_midi(pm, ps, pe)
 
-    with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
-        pm_phr.write(tmp.name)
-        base = get_global_embedding_from_midi(aria, tmp.name, device=args.device)
-    if not isinstance(base, torch.Tensor):
-        base = torch.tensor(base)
-    z = phrase_head(base.to(args.device).float()[None, ...])
-    z = nn.functional.normalize(z, p=2, dim=1).cpu().numpy().astype("float32")
+    vec = embed_pm_segment(
+        pm_seg=pm_phr,
+        tok=tok,
+        aria_model=aria,
+        proj_head=phrase_head,
+        device=args.device,
+        skip_if_empty=True,
+    )
+    if vec is None:
+        raise RuntimeError("Query phrase produced no tokens/notes after preprocessing.")
+    z = vec[None, :]  # (1, D) numpy float32
 
-    D, I = index.search(z, args.topk)
+    # z is the (1, D) normalized query vector as numpy float32
+    # Instead of "top-k rows regardless of file", pick top-k FILES by their best row
+
+    # Ensure xb is L2-normalized (done above with faiss.normalize_L2(xb)).
+    # Normalize the query just in case:
+    z = z / np.linalg.norm(z, ord=2, axis=1, keepdims=True).clip(1e-12)
+    # Cosine similarity to all context vectors
+    sims = xb @ z[0]  # (N,)
+
+    # For each file, keep the single best location (max similarity)
+    best_by_file = {}  # mf -> dict(similarity, idx)
+    for idx, (mf, cst, cen) in enumerate(meta):
+        s = float(sims[idx])
+        if (mf not in best_by_file) or (s > best_by_file[mf]["similarity"]):
+            # store best index + similarity for this file
+            best_by_file[mf] = {"similarity": s, "idx": idx}
+
+    # Rank files by their max similarity
+    items = sorted(
+        best_by_file.items(),
+        key=lambda kv: kv[1]["similarity"],
+        reverse=True
+    )
+    items = items[:args.topk]
+
+    # Build results with the best location per file
     results = []
-    for rank, (d, idx) in enumerate(zip(D[0], I[0]), 1):
-        mf, cst, cen = meta[idx]
-        results.append({"rank": rank, "similarity": float(d), "midi_path": mf,
-                        "context_bars": [int(cst), int(cen)]})
+    for rank, (mf, info) in enumerate(items, 1):
+        idx = info["idx"]
+        _, cst, cen = meta[idx]
+        results.append({
+            "rank": rank,
+            "similarity": float(info["similarity"]),
+            "midi_path": mf,
+            "best_context_bars": [int(cst), int(cen)],  # location of the max hit in this file
+        })
+
     import json
     print(json.dumps(results, indent=2))
+    
+@torch.no_grad()
+def embed_pm_segment(
+    pm_seg: pretty_midi.PrettyMIDI,
+    tok,                      # AbsTokenizer instance (e.g., AbsTokenizer())
+    aria_model,               # Aria embedding backbone (eval mode, on device)
+    proj_head: torch.nn.Module,  # context_head or phrase_head (eval mode, on device)
+    device: str = "cuda",
+    skip_if_empty: bool = True,
+) -> Optional[np.ndarray]:
+    """
+    Tokenize a pretty_midi.PrettyMIDI segment, run through Aria backbone, pool, then
+    project with the provided head and L2-normalize. Returns a (proj_dim,) float32 numpy
+    vector, or None if the segment is empty and skip_if_empty=True.
+
+    Parameters
+    ----------
+    pm_seg : pretty_midi.PrettyMIDI
+        Pre-sliced segment (e.g., a K-bar context or 4-bar phrase).
+    tok : AbsTokenizer
+        Tokenizer with .encode_pretty_midi(pm) -> (ids, mask).
+    aria_model : torch.nn.Module
+        Aria embedding model. Must accept input_ids, attention_mask and return (B, L, D) or similar.
+    proj_head : torch.nn.Module
+        Projection head (e.g., context_head or phrase_head). Outputs (B, proj_dim).
+    device : str
+        'cuda' or 'cpu'.
+    skip_if_empty : bool
+        If True, returns None when the segment has no pitched notes.
+
+    Returns
+    -------
+    Optional[np.ndarray]
+        L2-normalized vector of shape (proj_dim,), dtype float32; or None if skipped.
+    """
+    # Optional: skip segments with no notes (after drum filter)
+    if skip_if_empty:
+        if (not pm_seg.instruments) or all(len(inst.notes) == 0 for inst in pm_seg.instruments):
+            return None
+
+    # Tokenize
+    pair = _tok_ids_mask_from_pm(pm_seg, tok)
+    if pair is None:
+        return None if skip_if_empty else None
+    ids, mask = pair
+    if not ids or not any(mask):
+        return None if skip_if_empty else None
+
+    # Tensors on device
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)          # (1, L)
+    attention_mask = torch.tensor([mask], dtype=torch.long, device=device)    # (1, L)
+
+    seq = _aria_forward(aria_model, input_ids, attention_mask)  # (1, L, D) or (1, D)
+
+    # Mean-pool with mask → (1, D)
+    m = attention_mask.unsqueeze(-1).float()
+    pooled = (seq * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-6)
+
+    # Project + normalize → (1, proj_dim)
+    z = proj_head(pooled)
+    z = torch.nn.functional.normalize(z, p=2, dim=1)
+
+    # → (proj_dim,) float32 numpy
+    return z.squeeze(0).detach().cpu().numpy().astype("float32")
+
+def _tok_ids_mask_from_pm(pm_seg, tok) -> Optional[Tuple[list, list]]:
+    """
+    Try multiple tokenizer entry points to obtain (ids, mask) from a PrettyMIDI object.
+    Returns None if no tokens.
+    Compatible across aria-utils revisions that differ in API shape.
+    """
+    # 1) Direct pretty_midi path (newer utils)
+    for name in ("encode_pretty_midi", "encode_pm", "pm_to_ids", "from_pretty_midi"):
+        if hasattr(tok, name):
+            out = getattr(tok, name)(pm_seg)
+            # unify outputs
+            if isinstance(out, tuple) and len(out) == 2:
+                ids, mask = out
+            elif isinstance(out, dict):
+                ids = out.get("input_ids") or out.get("ids") or out.get("tokens")
+                mask = out.get("attention_mask") or out.get("mask")
+            else:
+                ids, mask = out, None
+            if ids is None:
+                return None
+            if mask is None:
+                mask = [1] * len(ids)
+            return ids, mask
+
+    # 2) Path-based encoders (common): write temp MIDI, then call encode_* on path/bytes
+    with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
+        pm_seg.write(tmp.name)
+        # ordered guesses
+        for name in ("encode_file", "encode_path", "encode_midi", "encode"):
+            if hasattr(tok, name):
+                out = getattr(tok, name)(tmp.name)
+                if isinstance(out, tuple) and len(out) == 2:
+                    ids, mask = out
+                elif isinstance(out, dict):
+                    ids = out.get("input_ids") or out.get("ids") or out.get("tokens")
+                    mask = out.get("attention_mask") or out.get("mask")
+                else:
+                    ids, mask = out, None
+                if ids is None:
+                    return None
+                if mask is None:
+                    mask = [1] * len(ids)
+                return ids, mask
+
+        # Some tokenizers implement __call__(path)
+        if callable(tok):
+            out = tok(tmp.name)
+            if isinstance(out, tuple) and len(out) == 2:
+                ids, mask = out
+            elif isinstance(out, dict):
+                ids = out.get("input_ids") or out.get("ids") or out.get("tokens")
+                mask = out.get("attention_mask") or out.get("mask")
+            else:
+                ids, mask = out, None
+            if ids is None:
+                return None
+            if mask is None:
+                mask = [1] * len(ids)
+            return ids, mask
+
+    # 3) Give up
+    return None
+
+def _aria_forward(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    """
+    Call the Aria embedding backbone regardless of signature differences across revisions.
+    Tries several common call signatures and returns a tensor of shape (B, L, D) or (B, D).
+    """
+    # Most likely: positional args (input_ids, attention_mask)
+    try:
+        out = model(input_ids, attention_mask)
+        return out[0] if isinstance(out, (tuple, list)) else out
+    except TypeError:
+        pass
+
+    # Some versions: (input_ids,) only
+    try:
+        out = model(input_ids)
+        return out[0] if isinstance(out, (tuple, list)) else out
+    except TypeError:
+        pass
+
+    # Some versions: keyword names x/mask
+    try:
+        out = model(x=input_ids, mask=attention_mask)
+        return out[0] if isinstance(out, (tuple, list)) else out
+    except TypeError:
+        pass
+
+    # Fallback: direct forward
+    try:
+        out = model.forward(input_ids, attention_mask)
+        return out[0] if isinstance(out, (tuple, list)) else out
+    except TypeError as e:
+        raise TypeError(
+            "Could not call Aria backbone; unknown forward signature. "
+            "Tried (ids,mask), (ids), and (x=,mask=)."
+        ) from e
 
 # -----------------------------
 # CLI
