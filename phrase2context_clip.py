@@ -29,6 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 # --- Aria embedding backbone ---
+from aria.embedding import get_global_embedding_from_midi
 from aria.model import TransformerEMB, ModelConfig
 from aria.config import load_model_config
 from ariautils.tokenizer import AbsTokenizer
@@ -353,18 +354,19 @@ def encode_contexts(args):
                     pm_ctx = slice_midi(pm, cs, ce)
                     if (not pm_ctx.instruments) or all(len(i.notes) == 0 for i in pm_ctx.instruments):
                         continue
-                    vec = embed_pm_segment(
-                        pm_seg=pm_ctx,
-                        tok=tok,
-                        aria_model=aria,
-                        proj_head=context_head,
-                        device=args.device,
-                        skip_if_empty=True,    # returns None if tokenization yields nothing
-                    )
-                    if vec is None:
-                        continue  # empty after tokenization/masking
-                    all_vecs.append(vec)
-                    wf.write(f"{mf}\t{i-args.k_bars}\t{i}\n")   # write metadata only if we appended
+                    with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
+                        pm_ctx.write(tmp.name)
+                        base = get_global_embedding_from_midi(
+                            model=aria,
+                            midi_path=tmp.name,
+                            device=args.device
+                        )
+                    if not isinstance(base, torch.Tensor):
+                        base = torch.tensor(base)
+                    z = context_head(base.to(args.device).float()[None, ...])
+                    z = torch.nn.functional.normalize(z, p=2, dim=1)
+                    all_vecs.append(z.squeeze(0).cpu().numpy().astype("float32"))
+                    wf.write(f"{mf}\t{i-args.k_bars}\t{i}\n")
             except Exception:
                 if os.environ.get("ENC_DEBUG"):
                     import traceback; traceback.print_exc()
@@ -418,17 +420,17 @@ def query(args):
     ps, pe = db[i0], db[i0 + 4]
     pm_phr = slice_midi(pm, ps, pe)
 
-    vec = embed_pm_segment(
-        pm_seg=pm_phr,
-        tok=tok,
-        aria_model=aria,
-        proj_head=phrase_head,
-        device=args.device,
-        skip_if_empty=True,
-    )
-    if vec is None:
-        raise RuntimeError("Query phrase produced no tokens/notes after preprocessing.")
-    z = vec[None, :]  # (1, D) numpy float32
+    with tempfile.NamedTemporaryFile(suffix=".mid", delete=True) as tmp:
+        pm_phr.write(tmp.name)
+        base = get_global_embedding_from_midi(
+            model=aria,
+            midi_path=tmp.name,
+            device=args.device
+        )
+    if not isinstance(base, torch.Tensor):
+        base = torch.tensor(base)
+    z = phrase_head(base.to(args.device).float()[None, ...])
+    z = torch.nn.functional.normalize(z, p=2, dim=1).cpu().numpy().astype("float32")
 
     # z is the (1, D) normalized query vector as numpy float32
     # Instead of "top-k rows regardless of file", pick top-k FILES by their best row
