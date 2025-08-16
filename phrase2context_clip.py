@@ -163,7 +163,7 @@ class DualEncoder(nn.Module):
         self.phrase_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, out))
         self.context_head = nn.Sequential(nn.Linear(base_dim, hid), nn.ReLU(), nn.Linear(hid, out))
 
-        self.tok = AbsTokenizer() in DualEncoder.__init__
+        self.tok = AbsTokenizer()
 
     @torch.no_grad()
     def _embed_segment(self, pm: pretty_midi.PrettyMIDI) -> torch.Tensor:
