@@ -22,10 +22,15 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
+
 import pretty_midi
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+from safetensors.torch import load_file
+
 from tqdm import tqdm
 
 # --- Aria embedding backbone ---
@@ -33,7 +38,6 @@ from aria.embedding import get_global_embedding_from_midi
 from aria.model import TransformerEMB, ModelConfig
 from aria.config import load_model_config
 from ariautils.tokenizer import AbsTokenizer
-from safetensors.torch import load_file
 
 # -----------------------------
 # Utilities: MIDI slicing & transposition
