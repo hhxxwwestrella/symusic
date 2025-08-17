@@ -27,7 +27,7 @@ import pretty_midi
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, get_worker_info, DataLoader
 
 from safetensors.torch import load_file
 
@@ -84,55 +84,47 @@ def transpose_inplace(pm: pretty_midi.PrettyMIDI, semitones: int):
 # -----------------------------
 # Dataset
 # -----------------------------
-class PhraseContextPairs(Dataset):
-    """
-    Yields pairs: (midi_path, (phrase_start_t, phrase_end_t), (ctx_start_t, ctx_end_t))
-    where phrase is 4 bars and context is the K bars immediately preceding.
-    """
-    def __init__(self,
-                 midi_files: List[Path],
-                 k_bars: int = 8,
-                 phrase_bars: int = 4,
-                 stride_bars: int = 1,
-                 max_pairs_per_file: Optional[int] = None,
-                 seed: int = 17,
-                 augment_transpose_steps: int = 0):
-        self.k_bars = k_bars
-        self.phrase_bars = phrase_bars
-        self.stride_bars = stride_bars
+class PhraseContextStream(IterableDataset):
+    def __init__(self, midi_files, k_bars=8, phrase_bars=4, stride_bars=1,
+                 max_pairs_per_file=None, seed=17, augment_transpose_steps=0, shuffle_files=True):
+        self.midi_files = list(midi_files)
+        self.k_bars = k_bars; self.phrase_bars = phrase_bars; self.stride_bars = stride_bars
         self.max_pairs_per_file = max_pairs_per_file
-        self.augment_transpose_steps = augment_transpose_steps
-        self.rng = random.Random(seed)
+        self.augment = augment_transpose_steps
+        self.seed = seed
+        self.shuffle_files = shuffle_files
 
-        self.items: List[Tuple[Path, float, float, float, float, int]] = []
-        for mf in midi_files:
-            try:
-                pm = pretty_midi.PrettyMIDI(str(mf))
-                db = load_downbeats(pm)
-                # windows like: [i-k, i) -> context, [i, i+4) -> phrase
-                # i runs where both segments fit inside db
-                candidates: List[Tuple[float,float,float,float]] = []
-                for i in range(self.k_bars, len(db) - self.phrase_bars):
-                    ctx_st, ctx_en = db[i - self.k_bars], db[i]
-                    phr_st, phr_en = db[i], db[i + self.phrase_bars]
-                    candidates.append((phr_st, phr_en, ctx_st, ctx_en))
-                # stride and cap
-                candidates = candidates[::max(1, self.stride_bars)]
-                if self.max_pairs_per_file is not None and len(candidates) > self.max_pairs_per_file:
-                    candidates = self.rng.sample(candidates, self.max_pairs_per_file)
-                # (path, phrase_start, phrase_end, ctx_start, ctx_end, transpose_steps)
-                for (ps, pe, cs, ce) in candidates:
-                    t = 0
-                    if self.augment_transpose_steps > 0:
-                        t = self.rng.randint(-self.augment_transpose_steps, self.augment_transpose_steps)
-                    self.items.append((mf, ps, pe, cs, ce, t))
-            except Exception:
-                continue
+    def _pairs_for_file(self, mf, rng):
+        try:
+            pm = pretty_midi.PrettyMIDI(str(mf))
+            db = load_downbeats(pm)
+            n = max(0, len(db) - (self.k_bars + self.phrase_bars))
+            if n <= 0:
+                return
+            # Sample indices directly instead of building a big list
+            step = max(1, self.stride_bars)
+            valid_is = range(self.k_bars, len(db) - self.phrase_bars, step)
+            if self.max_pairs_per_file and len(valid_is) > self.max_pairs_per_file:
+                valid_is = rng.sample(list(valid_is), self.max_pairs_per_file)
+            for i in valid_is:
+                cs, ce = db[i - self.k_bars], db[i]
+                ps, pe = db[i], db[i + self.phrase_bars]
+                t = 0 if self.augment == 0 else rng.randint(-self.augment, self.augment)
+                yield (mf, ps, pe, cs, ce, t)
+        except Exception:
+            return
 
-    def __len__(self): return len(self.items)
-
-    def __getitem__(self, idx: int):
-        return self.items[idx]
+    def __iter__(self):
+        wi = get_worker_info()
+        rng = random.Random(self.seed + (wi.id if wi else 0))
+        files = self.midi_files
+        if self.shuffle_files:
+            files = files.copy(); rng.shuffle(files)
+        if wi:
+            # shard by worker
+            files = files[wi.id::wi.num_workers]
+        for mf in files:
+            yield from self._pairs_for_file(mf, rng)
 
 # -----------------------------
 # Model: Aria backbone + projections
@@ -244,7 +236,7 @@ def train(args):
     if args.max_files is not None:
         midi_files = midi_files[:args.max_files]
 
-    ds = PhraseContextPairs(
+    ds = PhraseContextStream(
         midi_files=midi_files,
         k_bars=args.k_bars,
         phrase_bars=4,
@@ -253,8 +245,6 @@ def train(args):
         augment_transpose_steps=args.transpose
     )
 
-    print(f"Training pairs: {len(ds):,}")
-
     model = DualEncoder(aria_ckpt_path=args.aria_ckpt, device=args.device)
     model.to(args.device)
 
@@ -262,8 +252,14 @@ def train(args):
                             lr=args.lr, weight_decay=1e-4)
 
     collate = make_collate(k_bars=args.k_bars, phrase_bars=4, transpose_range=args.transpose)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                    num_workers=args.num_workers, collate_fn=collate, drop_last=True, pin_memory=True)
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=collate,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
     model.train()
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
