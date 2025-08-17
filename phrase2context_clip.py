@@ -214,6 +214,9 @@ def make_collate(k_bars: int, phrase_bars: int, transpose_range: int = 0):
                 pm = pretty_midi.PrettyMIDI(str(mf))
                 pm_phrase = slice_midi(pm, ps, pe)
                 pm_context = slice_midi(pm, cs, ce)
+                if not all(map(_has_pitched_notes, (pm_phrase, pm_context))):
+                    continue  # one of the pair is empty; skip
+
                 # transposition augmentation: apply same shift to both
                 if transpose_range > 0 and tsteps != 0:
                     transpose_inplace(pm_phrase, tsteps)
@@ -649,7 +652,15 @@ def _save_heads(model, out_dir: Path, tag: str, k_bars: int):
         "proj_dim": model.phrase_head[-1].out_features,
         "k_bars": k_bars
     }, out_dir / f"proj_heads_{tag}.pt")
-    
+
+
+def _has_pitched_notes(pm: pretty_midi.PrettyMIDI) -> bool:
+    # True if any non-drum instrument has ≥1 note
+    for inst in pm.instruments:
+        if not inst.is_drum and len(inst.notes) > 0:
+            return True
+    return False
+
 # -----------------------------
 # CLI
 # -----------------------------
