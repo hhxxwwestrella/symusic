@@ -4,7 +4,7 @@ import numpy as np
 import pretty_midi
 
 # --- config ---
-SHARDS_DIR = "./shards"   # directory that contains tokens-00000.tar.gz
+SHARDS_DIR = "../shards"   # directory that contains tokens-00000.tar.gz
 
 # --- robust downbeats mirror (same fallback you used) ---
 def load_downbeats(pm: pretty_midi.PrettyMIDI):

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === Config ===
+SRC_DIR="${1:-/path/to/midis}"             # directory to scan for files
+OUT_DIR="${2:-/path/to/output_archives}"   # where to place the .tar.gz files
+BATCH_SIZE="${BATCH_SIZE:-10000}"          # files per archive
+GLOB="${GLOB:-*.mid}"                      # which files to include
+PREFIX="${PREFIX:-bundle}"                 # archive filename prefix (bundle-000001.tar.gz, ...)
+
+# Use pigz (parallel gzip) if available, else fallback to gzip
+COMP="gzip"
+if command -v pigz >/dev/null 2>&1; then
+  COMP="pigz"
+fi
+
+mkdir -p "$OUT_DIR"
+
+# Safety: refuse to run if OUT_DIR is inside SRC_DIR (to avoid packing our own archives)
+case "$OUT_DIR" in
+  "$SRC_DIR"/*|"$SRC_DIR") echo "ERROR: OUT_DIR must not be inside SRC_DIR"; exit 1 ;;
+esac
+
+echo "Packing from: $SRC_DIR"
+echo "Archives to:  $OUT_DIR"
+echo "Batch size:   $BATCH_SIZE"
+echo "Glob:         $GLOB"
+echo "Compressor:   $COMP"
+echo
+
+# Generate a stable, null-delimited list of files matching the glob.
+# -print0 protects against spaces/newlines
+# The 'shopt -s nullglob' behavior is replicated by find -name "$GLOB"
+mapfile -d '' FILES < <(find "$SRC_DIR" -type f -name "$GLOB" -print0)
+
+total=${#FILES[@]}
+if (( total == 0 )); then
+  echo "No files matching '$GLOB' under $SRC_DIR"
+  exit 0
+fi
+
+echo "Found $total files."
+
+# Function to create one archive for the range [start, end)
+pack_chunk () {
+  local start="$1"
+  local end="$2"
+  local idx="$3"   # 1-based archive index for naming
+
+  # Build archive name
+  printf -v archive "%s/%s-%06d.tar.gz" "$OUT_DIR" "$PREFIX" "$idx"
+
+  # If archive already exists, assume done (resume-friendly)
+  if [[ -f "$archive" ]]; then
+    echo "SKIP (exists): $archive"
+    return 0
+  fi
+
+  # Create a temp filelist (null-delimited)
+  local list
+  list="$(mktemp)"
+  # shellcheck disable=SC2068
+  {
+    for ((i=start; i<end; i++)); do
+      printf '%s\0' "${FILES[$i]}"
+    done
+  } > "$list"
+
+  echo "Creating: $archive  (files: $((end - start)))"
+
+  # Use tar with --files-from (null-delimited) and --remove-files to delete originals after adding
+  # -I $COMP lets tar use pigz if available; fallback is gzip
+  # Note: GNU tar required for --null and --remove-files with -T
+  tar -I "$COMP" -czf "$archive" \
+      --remove-files \
+      --null \
+      --files-from="$list"
+
+  rm -f "$list"
+}
+
+# Main batching loop
+archive_idx=0
+for ((start=0; start<total; start+=BATCH_SIZE)); do
+  end=$(( start + BATCH_SIZE ))
+  if (( end > total )); then end="$total"; fi
+  archive_idx=$(( archive_idx + 1 ))
+  pack_chunk "$start" "$end" "$archive_idx"
+done
+
+# Clean up empty directories left behind
+echo "Cleaning up empty directories under $SRC_DIR..."
+find "$SRC_DIR" -type d -empty -delete || true
+
+echo "Done. Created $archive_idx archives in $OUT_DIR."

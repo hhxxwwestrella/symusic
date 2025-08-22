@@ -146,131 +146,9 @@ class PhraseContextPairs(Dataset):
 # -----------------------------
 # Model: Aria backbone + projections
 # -----------------------------
-def _token_budget_batches(token_lens, budget: int):
-    """Yield (start, end) ranges of indices so that sum(token_lens[start:end]) <= budget."""
-    n = len(token_lens)
-    i = 0
-    while i < n:
-        acc = 0
-        j = i
-        while j < n and acc + token_lens[j] <= budget:
-            acc += token_lens[j]
-            j += 1
-        if j == i:  # single huge item; ensure forward progress
-            j += 1
-        yield i, j
-        i = j
-
-def _coerce_int_list(lst):
-    """
-    Ensure a list/array/tuple of tokens or masks is a Python list[int].
-    Accepts numpy arrays, lists of str, lists of np types, etc.
-    """
-    if lst is None:
-        return []
-    # numpy -> list
-    try:
-        import numpy as _np
-        if isinstance(lst, _np.ndarray):
-            lst = lst.tolist()
-    except Exception:
-        pass
-    if not isinstance(lst, (list, tuple)):
-        # Some tokenizers return tensors — handle those too
-        try:
-            lst = list(lst)
-        except Exception:
-            lst = [lst]
-    # Cast each element to int
-    out = []
-    for x in lst:
-        # handle e.g. np.int32, np.int64, torch tensors scalars, strings
-        try:
-            out.append(int(x))
-        except Exception:
-            # last resort: strip then int
-            out.append(int(str(x).strip()))
-    return out
-
-
-def _tokenize_one(seg_bytes: bytes):
-    import pretty_midi, io, tempfile, os as _os
-    from ariautils.tokenizer import AbsTokenizer
-
-    tok = AbsTokenizer()
-
-    # bytes -> PrettyMIDI (fallback to temp file if needed)
-    try:
-        pm = pretty_midi.PrettyMIDI(io.BytesIO(seg_bytes))
-    except TypeError:
-        with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp:
-            tmp.write(seg_bytes)
-            tmp_path = tmp.name
-        try:
-            pm = pretty_midi.PrettyMIDI(tmp_path)
-        finally:
-            try: _os.unlink(tmp_path)
-            except OSError: pass
-
-    pair = _tok_ids_mask_from_pm(pm, tok)
-    if pair is None:
-        return None
-    ids, mask = pair
-
-    # ---- ensure IDs are integers ----
-    def _map_token_to_id(t):
-        # already int-like
-        try:
-            return int(t)
-        except Exception:
-            pass
-        # tokenizer-specific mappings (try a few common patterns)
-        if hasattr(tok, "token_to_id"):
-            v = tok.token_to_id(t)
-            if v is not None:
-                return int(v)
-        if hasattr(tok, "vocab") and isinstance(tok.vocab, dict):
-            if t in tok.vocab:
-                return int(tok.vocab[t])
-        if hasattr(tok, "stoi") and isinstance(tok.stoi, dict):
-            if t in tok.stoi:
-                return int(tok.stoi[t])
-        if hasattr(tok, "token2id") and isinstance(tok.token2id, dict):
-            if t in tok.token2id:
-                return int(tok.token2id[t])
-        # last resort: unknown token → eos if available, else 0
-        try:
-            return int(getattr(tok, "eos_tok"))
-        except Exception:
-            return 0
-
-    # map all ids to ints if any are non-ints
-    if ids and not isinstance(ids[0], int):
-        ids = [_map_token_to_id(t) for t in ids]
-    else:
-        ids = [int(x) for x in ids]  # also coerces numpy scalars/strings like "42"
-
-    # coerce mask to ints and align length
-    mask = [int(x) for x in (mask or [])]
-    if len(mask) != len(ids):
-        L = len(ids)
-        mask = (mask + [1] * L)[:L]
-
-    # clamp length if your code uses MAX_EMBEDDING_SEQ_LEN
-    max_len = globals().get("MAX_EMBEDDING_SEQ_LEN", None)
-    if max_len is not None:
-        ids  = ids[:max_len]
-        mask = mask[:max_len]
-
-    # restore EOS if truncated
-    try:
-        eos_id = int(getattr(tok, "eos_tok"))
-    except Exception:
-        eos_id = ids[-1] if ids else 0
-    if ids and ids[-1] != eos_id:
-        ids[-1] = eos_id
-
-    return (ids, mask)
+def _token_budget_batches(token_lens, budget: int): pass # unused
+def _coerce_int_list(lst): pass # unused
+def _tokenize_one(seg_bytes: bytes): pass # unused
 
 @torch.no_grad()
 def get_pooled_base_embeddings_from_pm_batch(
@@ -324,6 +202,7 @@ def get_pooled_base_embeddings_from_pm_batch(
             yield seq[s:s+bs]
 
     pooled_cpu = {}
+    # Following line has no effect.
     amp_ctx = torch.cuda.amp.autocast if (use_amp and device.type == "cuda") else torch.autocast
     with torch.no_grad():
         for chunk in make_batches(valid, batch_size):
@@ -434,7 +313,9 @@ def _tokenize_pm_list(pm_list: List[pretty_midi.PrettyMIDI], tok: AbsTokenizer):
         except Exception:
             eos = ids[-1] if ids else 0
         if ids and ids[-1] != eos:
-            ids[-1] = eos
+            # Weird, that it would rewrite the last token. This should
+            # probably go before the calculation of the mask
+            ids[-1] = eos 
         if not ids or not any(mask):
             continue
         ids_list.append(ids)
@@ -493,7 +374,11 @@ class DualEncoder(nn.Module):
         ids_p, m_p, kept_p = _tokenize_pm_list(pm_phr, tok)
         ids_c, m_c, kept_c = _tokenize_pm_list(pm_ctx, tok)
 
-        # Align by original indices: keep only indices present in BOTH
+        # Align by original indices: keep only indices present in
+        # BOTH. This is necessary because either the phrase on the
+        # context at a given index in the batch could be rejected
+        # during tokenization. (The indices here are over the pairs in
+        # the batch.)
         set_p, set_c = set(kept_p), set(kept_c)
         common = sorted(set_p & set_c)
         if len(common) < 2:
@@ -632,21 +517,8 @@ def train(args):
     # -----------------------------
 # Encoding contexts for indexing
 # -----------------------------
-def _iter_items_from_shards(shards_dir: Path):
-    """Yield (uid, meta, context_ids) from all tar.gz shards."""
-    shard_paths = sorted(glob.glob(str(shards_dir / "tokens-*.tar*")))
-    for sp in shard_paths:
-        with tarfile.open(sp, "r:*") as tf:
-            metas = [m for m in tf.getmembers() if m.name.endswith(".meta.json")]
-            for m in metas:
-                stem = m.name[:-len(".meta.json")]
-                def get_bytes(name):
-                    fobj = tf.extractfile(name)
-                    return fobj.read() if fobj else None
-
-                meta = json.load(io.BytesIO(get_bytes(m.name)))
-                cid = np.load(io.BytesIO(get_bytes(f"{stem}.context_ids.npy")))
-                yield Path(stem).name, meta, cid
+def _iter_items_from_shards(shards_dir: Path): # Unused
+    pass
 
 @torch.no_grad()
 def encode_contexts(args):
@@ -741,7 +613,7 @@ def encode_contexts(args):
                         ids = cid.astype(np.int64, copy=False)
 
                         if ids.size == 0:
-                            pbar.update(1)
+                            pbar.update(1) # This results in two updates, one here and one in the finally
                             continue
                         span = (meta["start_bar"], meta["start_bar"] + meta["k_bars"])
                         batch_ids.append(ids)
@@ -890,11 +762,13 @@ def query(args):
 
     # load indexable vectors
     vecs = np.load(Path(args.index_dir) / "contexts.f32.npy")
+    # Loading entire metadata into memory isn't going to work.
     meta = [line.strip().split("\t") for line in open(Path(args.index_dir) / "contexts.tsv", "r", encoding="utf-8")]
 
     # build or load FAISS (exact IP on L2-normalized vectors == cosine)
     xb = vecs  # (N,D)
     d = xb.shape[1]
+    # I think this is also probably in-memory. But also, this is never even used!!!
     index = faiss.IndexFlatIP(d)
     faiss.normalize_L2(xb)
     index.add(xb)
@@ -1037,31 +911,13 @@ def embed_pm_segment(
     # → (proj_dim,) float32 numpy
     return z.squeeze(0).detach().cpu().numpy().astype("float32")
 
-def _tok_ids_mask_from_pm(pm_seg, tok) -> Optional[Tuple[List[int], List[int]]]:
-    def _pm_to_bytes(pm: pretty_midi.PrettyMIDI) -> bytes:
-        bio = io.BytesIO()
-        pm.write(bio)            # pretty_midi accepts file-like objects
-        return bio.getvalue()
+def _tok_ids_mask_from_pm(pm_seg, tok) -> Optional[Tuple[List[int], List[int]]]: # Unused
+    pass
 
-    mid_bytes = _pm_to_bytes(pm_seg)
-    md = MidiDict_allowing_buffer.from_midi_bytes(mid_bytes)
-
-    if len(md.note_msgs) == 0:
-        return None
-
-    tokens = tok.tokenize(md, add_dim_tok=False)
-    if tokens is None or len(tokens) == 0:
-        return None
-
-    # ensure we have int ids
-    ids = tok.encode(tokens)
-    if ids is None or len(ids) == 0:
-        return None
-
-    mask = [1] * len(ids)
-    return ids, mask
-
-def _aria_forward(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+# According to ChatGPT, this will build gradients for the Aria model,
+# which are never used. We should either set `requires_grad = False`
+# on all parameters, or decorate this with `@torch.no_grad`
+def _aria_forWward(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     """
     Call the Aria embedding backbone regardless of signature differences across revisions.
     Tries several common call signatures and returns a tensor of shape (B, L, D) or (B, D).

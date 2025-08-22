@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
 import argparse, base64, boto3, botocore, gzip, io, json, os, sys, time, textwrap, random
+import subprocess
 from urllib.parse import urlparse
 from collections import defaultdict
 
 # --------------------
 # Helpers
 # --------------------
+def clear_done_markers(output_prefix: str, region: str):
+    """Remove any old _done markers from the output prefix."""
+    print(f"[INFO] Clearing old _done markers under {output_prefix}/_done/")
+    subprocess.run(
+        [
+            "aws", "s3", "rm",
+            f"{output_prefix.rstrip('/')}/_done/",
+            "--recursive", "--region", region
+        ],
+        check=False,
+    )
+
 def parse_s3_uri(uri: str):
     u = urlparse(uri)
     if u.scheme != "s3" or not u.netloc:
@@ -72,7 +85,7 @@ def build_user_data(
     region,
     shard_index,
     manifest_s3_uri,
-    input_prefix_s3,
+    input_prefix_s3,      # kept for logging only
     output_prefix_s3,
     code_zip_s3_uri,
     tokenizer_cli_args,
@@ -80,99 +93,87 @@ def build_user_data(
     work_dir="/opt/worker",
     max_dl_workers=32,
 ):
-    """
-    Returns a valid cloud-init user-data string that:
-      - installs deps
-      - pulls code + requirements
-      - downloads this shard's files (from manifest)
-      - runs tokenizer.py
-      - syncs outputs and writes a _done marker
-    """
-
+    # safest way to embed arbitrary args in bash
+    tok_args_json = json.dumps(tokenizer_cli_args or "")
     shard_name = f"shard-{shard_index:03d}"
 
-    # 1) Build the inner bash script first (single f-string).
-    script_body = textwrap.dedent(f"""
-        set -euo pipefail
+    # First term in this concatenation uses *local* fstrings, second
+    # is *remote* fstrings
+    return f"""#!/bin/bash
+set -euox pipefail
 
-        REGION="{region}"
-        MANIFEST_URI="{manifest_s3_uri}"
-        INPUT_S3_PREFIX="{input_prefix_s3.rstrip('/')}"
-        OUTPUT_S3_PREFIX="{output_prefix_s3.rstrip('/')}"
-        CODE_ZIP_URI="{code_zip_s3_uri}"
-        SHARD="{shard_name}"
-        WORK_DIR="{work_dir}"
-        VENV_DIR="{venv_dir}"
-        DATA_DIR="/mnt/data/{shard_name}"
-        OUT_DIR="/mnt/out/{shard_name}"
-        LOG_DIR="/var/log/tokenizer"
-        DL_WORKERS="{int(max_dl_workers)}"
+REGION="{region}"
+MANIFEST_URI="{manifest_s3_uri}"
+INPUT_S3_PREFIX="{input_prefix_s3.rstrip('/')}"
+OUTPUT_S3_PREFIX="{output_prefix_s3.rstrip('/')}"
+CODE_ZIP_URI="{code_zip_s3_uri}"
+SHARD="{shard_name}"
+WORK_DIR="{work_dir}"
+VENV_DIR="{venv_dir}"
+DATA_DIR="/mnt/data/$SHARD"
+OUT_DIR="/mnt/out/$SHARD"
+LOG_DIR="/var/log/tokenizer"
+DL_WORKERS="{max_dl_workers}"
+TOK_ARGS=$(python3 - <<'PY'
+import json; print(json.loads({tok_args_json!r}))
+PY
+)
+""" + \
+    """
+mkdir -p "$WORK_DIR" "$DATA_DIR" "$OUT_DIR" "$LOG_DIR"
+echo "region=$REGION shard=$SHARD input=$INPUT_S3_PREFIX output=$OUTPUT_S3_PREFIX" | tee -a "$LOG_DIR/$SHARD.log"
 
-        mkdir -p "$WORK_DIR" "$DATA_DIR" "$OUT_DIR" "$LOG_DIR"
-        aws configure set default.region "$REGION" || true
+# Log any errors to S3 output bucket, for debugging purposes
+trap 'set +e;
+  test -f "$LOG_DIR/$SHARD.log" && aws s3 cp "$LOG_DIR/$SHARD.log" "$OUTPUT_S3_PREFIX/_logs/$SHARD.log";
+  aws s3 sync "$OUT_DIR" "$OUTPUT_S3_PREFIX/$SHARD/" --no-progress || true' EXIT
 
-        # Install packages
-        if command -v dnf >/dev/null 2>&1; then PKG="dnf";
-        elif command -v yum >/dev/null 2>&1; then PKG="yum";
-        else PKG="apt-get"; fi
-        sudo $PKG -y update || true
-        sudo $PKG -y install python3 python3-venv unzip jq awscli git || true
+# --- pkgs ---
+if command -v dnf >/dev/null 2>&1; then PKG=dnf; elif command -v yum >/dev/null 2>&1; then PKG=yum; else PKG=apt-get; fi
+sudo $PKG -y update
+sudo $PKG -y install python3.11 unzip jq awscli git tar
 
-        # Python env
-        python3 -m venv "$VENV_DIR"
-        . "$VENV_DIR/bin/activate"
-        pip install --upgrade pip wheel setuptools
+# --- install uv ---
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"   # location of uv
 
-        # Pull code
-        aws s3 cp "$CODE_ZIP_URI" "$WORK_DIR/code.zip"
-        unzip -q -o "$WORK_DIR/code.zip" -d "$WORK_DIR/code"
 
-        # Install requirements (fallback minimal set)
-        if [ -f "$WORK_DIR/code/requirements.txt" ]; then
-          pip install -r "$WORK_DIR/code/requirements.txt"
-        else
-          pip install numpy mido pretty_midi boto3
-        fi
+aws configure set default.region "$REGION"
 
-        # Use multiprocessing; keep BLAS single-threaded
-        export OMP_NUM_THREADS=1
-        export MKL_NUM_THREADS=1
-        export OPENBLAS_NUM_THREADS=1
-        ulimit -n 1048576 || true
+# --- python env ---
+uv venv --python 3.11 "$VENV_DIR" # python3.11 required by aria
+. "$VENV_DIR/bin/activate"
+uv pip install -U pip wheel setuptools boto3 botocore
 
-        # Download manifest
-        aws s3 cp "$MANIFEST_URI" "$WORK_DIR/manifest.jsonl.gz"
+# --- code artifact ---
+aws s3 cp "$CODE_ZIP_URI" "$WORK_DIR/code.zip"
+code_dir="$WORK_DIR/code"
+rm -rf "$code_dir"
+unzip -q -o "$WORK_DIR/code.zip" -d "$WORK_DIR/code"
 
-        # Downloader: concurrent small-file pulls
-        cat > "$WORK_DIR/download_by_manifest.py" << 'PY'
-import json, gzip, os, sys, concurrent.futures, boto3
+tokenizer_dir="$code_dir/tokenizer"
+
+uv pip install -r "$tokenizer_dir/requirements.txt"
+
+# avoid oversubscribing CPU when tokenizer parallelizes
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+ulimit -n 1048576
+
+# --- fetch manifest ---
+aws s3 cp "$MANIFEST_URI" "$WORK_DIR/manifest.jsonl.gz"
+
+# --- archive-aware fetch & prepare ---
+cat > "$WORK_DIR/fetch_and_prepare.py" <<'PY'
+import json, gzip, os, sys, concurrent.futures, boto3, botocore, subprocess
 from urllib.parse import urlparse
-import botocore
 
 manifest_gz = sys.argv[1]
-dest_root = sys.argv[2]
-max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 32
+extract_root = sys.argv[2]
+max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 
-def parse_s3(uri):
-    u = urlparse(uri)
-    if u.scheme != "s3": raise ValueError("bad uri: " + uri)
-    return u.netloc, u.path.lstrip("/")
-
-s3 = boto3.client("s3")
-
-def dl(one):
-    u = one.strip()
-    if not u: return
-    b,k = parse_s3(u)
-    rel = k.split("/", 1)[1] if "/" in k else os.path.basename(k)
-    dest = os.path.join(dest_root, rel)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    try:
-        s3.download_file(b, k, dest)
-        return dest
-    except botocore.exceptions.ClientError as e:
-        print(f"[WARN] download failed {{u}}: {{e}}", file=sys.stderr)
-        return None
+def parse_s3(u):
+    x = urlparse(u); assert x.scheme == "s3" and x.netloc
+    return x.netloc, x.path.lstrip("/")
 
 def rows():
     with gzip.open(manifest_gz, "rt") as f:
@@ -180,65 +181,85 @@ def rows():
             j = json.loads(line)
             yield j["s3_uri"]
 
+s3 = boto3.client("s3")
+os.makedirs(extract_root, exist_ok=True)
+
+def is_tar_gz(key): return key.endswith(".tar.gz")
+
+def dl(b, k, dest):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    s3.download_file(b, k, dest)
+
+def extract(archive, dest):
+    os.makedirs(dest, exist_ok=True)
+    # Use system tar; -xzf extracts gzip archives; -C changes into dest
+    subprocess.check_call(["tar", "-xzf", archive, "-C", dest])
+
+def handle(uri):
+    b,k = parse_s3(uri)
+    if is_tar_gz(k):
+        scratch = os.path.join(extract_root, "_archives")
+        os.makedirs(scratch, exist_ok=True)
+        local = os.path.join(scratch, os.path.basename(k))
+        dl(b,k,local)
+        extract(local, extract_root)
+        try: os.remove(local)
+        except OSError: pass
+        return ("arc", k)
+    else:
+        rel = k.split("/",1)[1] if "/" in k else os.path.basename(k)
+        dest = os.path.join(extract_root, rel)
+        dl(b,k,dest)
+        return ("obj", k)
+
 def main():
-    todo = list(rows())
-    print(f"Downloading {{len(todo)}} files to {{dest_root}}")
+    items = list(rows())
+    print(f"[prep] items={len(items)} into {extract_root}")
+    ok = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for i, _ in enumerate(ex.map(dl, todo, chunksize=32), 1):
-            if i % 500 == 0:
-                print(f"  ... {{i}} / {{len(todo)}}")
-    print("Done downloads.")
+        for i,res in enumerate(ex.map(handle, items, chunksize=4),1):
+            ok += 1
+            if i % 50 == 0: print(f"[prep] {i}/{len(items)}")
+    print(f"[prep] done: {ok}/{len(items)}")
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[prep][ERROR] {e}", file=sys.stderr); raise
 PY
 
-        python "$WORK_DIR/download_by_manifest.py" "$WORK_DIR/manifest.jsonl.gz" "$DATA_DIR" "$DL_WORKERS"
+uv run "$WORK_DIR/fetch_and_prepare.py" "$WORK_DIR/manifest.jsonl.gz" "$DATA_DIR" "$DL_WORKERS" 2>&1 | tee -a "$LOG_DIR/$SHARD.log"
 
-        # Run tokenizer
-        cd "$WORK_DIR/code"
+# --- run tokenizer ---
+cd "$tokenizer_dir"
+CORES=$(nproc || echo 16)
+W=$(( CORES>8 ? CORES-4 : CORES ))
+echo "[run] tokenizer workers=$W" | tee -a "$LOG_DIR/$SHARD.log"
+set +e
+python tokenizer.py \
+  --midi-root "$DATA_DIR" \
+  --out-dir "$OUT_DIR" \
+  --num-workers "$W" \
+  --log-level INFO \
+  $TOK_ARGS 2>&1 | tee -a "$LOG_DIR/$SHARD.log"
+rc=$?
+set -e
 
-        CORES=$(nproc || echo 16)
-        W=$((CORES>8 ? CORES-4 : CORES))
+# --- upload outputs regardless; then mark done ---
+aws s3 sync "$OUT_DIR" "$OUTPUT_S3_PREFIX/$SHARD/" --no-progress
 
-        echo "Running tokenizer with $W workers"
-        set +e
-        python tokenizer.py \
-          --midi-root "$DATA_DIR" \
-          --out-dir "$OUT_DIR" \
-          --num-workers "$W" \
-          --log-level INFO \
-          {tokenizer_cli_args} | tee "$LOG_DIR/$SHARD.log"
-        RC=$?
-        set -e
-
-        # Upload outputs & mark done (even if RC!=0 we ship what's there)
-        aws s3 sync "$OUT_DIR" "$OUTPUT_S3_PREFIX/$SHARD/" --no-progress
-
-        python - <<PY
+python - <<'PY'
 import json, os
-d = {{"shard": "{shard_name}", "exit_code": {{}}, "host": os.uname().nodename}}
-open("{work_dir}/DONE.json","w").write(json.dumps(d))
+d = {"shard": os.environ.get("SHARD","unknown"),
+     "host": os.uname().nodename,
+     "exit_code": int(os.environ.get("rc","0")) if os.environ.get("rc") else 0}
+open("/opt/worker/DONE.json","w").write(json.dumps(d))
 PY
+aws s3 cp "/opt/worker/DONE.json" "$OUTPUT_S3_PREFIX/_done/$SHARD.done"
 
-        # Replace the {{}} placeholder with RC (portable)
-        sed -i "s/{{}}/$RC/g" "{work_dir}/DONE.json"
-
-        aws s3 cp "{work_dir}/DONE.json" "$OUTPUT_S3_PREFIX/_done/{shard_name}.done"
-        echo "DONE with code $RC"
-    """).strip()
-
-    # 2) Escape single quotes for the YAML inline exec array:  - [ bash, -lc, '<script>' ]
-    #    Use the classic bash-safe split: 'foo'"'"'bar'
-    script_escaped = script_body.replace("'", "'\"'\"'")
-
-    # 3) Assemble cloud-init (no nested f-strings).
-    user_data = (
-        "#cloud-config\n"
-        "runcmd:\n"
-        f"  - [ bash, -lc, '{script_escaped}' ]\n"
-    )
-
-    return user_data
+echo "[done] exit=$rc" | tee -a "$LOG_DIR/$SHARD.log"
+exit "$rc"
+"""
 
 # --------------------
 # Main Orchestrator
@@ -310,6 +331,9 @@ def main():
         print(f"Uploading manifest {i+1}/{n} -> s3://{manifest_bucket}/{man_key}")
         s3_put_jsonl_gz(s3, manifest_bucket, man_key, rows())
         manifest_uris.append(f"s3://{manifest_bucket}/{man_key}")
+
+    # Remove any "done" sentinels from prior runs
+    clear_done_markers(args.s3_output_prefix, args.region)
 
     # 3) Launch instances
     code_zip_uri = args.s3_code_zip

@@ -1,12 +1,16 @@
 # quick_check.py
-import numpy as np, torch, pretty_midi
+import sys
 from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+import numpy as np, torch, pretty_midi
 from aria.model import TransformerEMB, ModelConfig
 from aria.config import load_model_config
 from ariautils.tokenizer import AbsTokenizer
 from safetensors.torch import load_file
-import torch.nn as nn
-from aria.embedding import MidiDict
+
+
+
 
 # from phrase2context_clip_new import (
 #     slice_midi, load_downbeats,
@@ -28,71 +32,131 @@ aria.to(DEVICE).eval()
 
 tok = AbsTokenizer()
 
-# # Collect a few context segments
-# files = sorted(Path("mini_midis").glob("*.mid"))[:5]
-# pm_segments = []
-# names = []
-# for mf in files:
-#     pm = pretty_midi.PrettyMIDI(str(mf))
-#     db = load_downbeats(pm)
-#     if len(db) >= K_BARS + 1:
-#         pm_ctx = slice_midi(pm, db[0], db[K_BARS])
-#         pm_segments.append(pm_ctx); names.append(mf.name)
-#
-# # Run batched embedding (global emb per segment)
-# vecs = embed_pm_segments(aria, tok, pm_segments, device=DEVICE)   # (N, D)
-# vecs_np = vecs.detach().cpu().numpy()
-#
-# print("files tested:", names)
-# print("shape:", vecs_np.shape)
-# print("pairwise L2 distance from vec[0]:", [float(np.linalg.norm(vecs_np[0]-v)) for v in vecs_np])
-# print("variance across all vectors:", float(vecs_np.var()))
-#
-# from aria.embedding import get_global_embedding_from_midi
-#
-# # compare first sample
-# import tempfile, os
-# ramdir = "/dev/shm" if os.path.isdir("/dev/shm") else None
-# with tempfile.NamedTemporaryFile(suffix=".mid", dir=ramdir, delete=True) as tmp:
-#     pm_segments[0].write(tmp.name)
-#     base_helper = get_global_embedding_from_midi(model=aria, midi_path=tmp.name, device=DEVICE)
-#     if not isinstance(base_helper, torch.Tensor):
-#         base_helper = torch.tensor(base_helper, device=DEVICE)
-#     base_batched = vecs[0].to(DEVICE)
-#     cos = torch.nn.functional.cosine_similarity(base_helper[None], base_batched[None]).item()
-#     print("cosine(helper vs batched):", cos)
-from phrase2context_clip import DualEncoder
-pm = pretty_midi.PrettyMIDI("mini_midis/121437_1.mid")
-
-
-from ariautils.tokenizer import AbsTokenizer
-from phrase2context_clip_new import slice_midi, _tok_ids_mask_from_pm, PhraseContextPairs
+import io, json, tarfile, glob, os
+from pathlib import Path
+import numpy as np
 import pretty_midi
-midi_root = Path("mini_midis")
-midi_files = list(midi_root.rglob("*.mid"))
-ds = PhraseContextPairs(midi_files=midi_files, k_bars=8, phrase_bars=4)
+
+# --- config ---
+SHARDS_DIR = "./shards"   # directory that contains tokens-00000.tar.gz
+
+# --- robust downbeats mirror (same fallback you used) ---
+def load_downbeats(pm: pretty_midi.PrettyMIDI):
+    try:
+        db = pm.get_downbeats()
+        if db is not None and len(db) >= 2:
+            return np.asarray(db, dtype=np.float32)
+    except Exception:
+        pass
+    # fallback 4/4 @ 120 BPM
+    total = pm.get_end_time()
+    if total <= 0:  # degenerate
+        return np.array([0.0, 1.0], dtype=np.float32)
+    bar_sec = 2.0  # 4/4 @ 120bpm → 0.5s/beat * 4
+    n_bars = max(2, int(np.ceil(total / bar_sec)) + 1)
+    return (np.arange(n_bars, dtype=np.float32) * bar_sec)
+
+# --- find the first shard ---
+def first_shard(shards_dir: str|Path) -> Path:
+    candidates = sorted(
+        [Path(p) for p in glob.glob(os.path.join(str(shards_dir), "tokens-*.tar*"))]
+    )
+    if not candidates:
+        raise FileNotFoundError("No shards found matching tokens-*.tar*")
+    return candidates[0]
 
 
-tok = AbsTokenizer()
+# --- read one item (meta + sibling npys) from a shard ---
+def read_one_item_from_shard(shard_path: Path):
+    with tarfile.open(shard_path, "r:*") as tf:
+        # pick the first meta.json entry
+        metas = [m for m in tf.getmembers() if m.name.endswith(".meta.json")]
+        if not metas:
+            raise RuntimeError("Shard has no *.meta.json entries")
+        m = metas[0]
+        stem = m.name[:-len(".meta.json")]  # e.g. 'UID' or 'subdir/UID'
 
-# mf, ps, pe, cs, ce, t = ds[0]
-# pm = pretty_midi.PrettyMIDI(str(mf))
-#
-# pm_phrase = slice_midi(pm, ps, pe)
-# pm_context = slice_midi(pm, cs, ce)
-#
-# ids_p, mask_p = _tok_ids_mask_from_pm(pm_phrase, tok)
-# ids_c, mask_c = _tok_ids_mask_from_pm(pm_context, tok)
-#
-# print("Phrase tokens:", ids_p[:50], "... len=", len(ids_p))
-# print("Context tokens:", ids_c[:50], "... len=", len(ids_c))
+        def get_bytes(name: str):
+            # guard in case tar has dirs; tarfile.getmember raises if missing
+            names = set(tf.getnames())
+            if name not in names:
+                raise KeyError(f"Missing entry in tar: {name}")
+            fobj = tf.extractfile(name)
+            return fobj.read() if fobj is not None else None
 
-from ariautils.tokenizer import AbsTokenizer
-from aria.embedding import _get_chunks, _validate_midi_for_emb
+        meta = json.load(io.BytesIO(get_bytes(m.name)))
+        pid = f"{stem}.phrase_ids.npy"
+        pat = f"{stem}.phrase_attn.npy"
+        cid = f"{stem}.context_ids.npy"
+        cat = f"{stem}.context_attn.npy"
+
+        phr_ids = np.load(io.BytesIO(get_bytes(pid)))
+        phr_attn = np.load(io.BytesIO(get_bytes(pat)))
+        ctx_ids = np.load(io.BytesIO(get_bytes(cid)))
+        ctx_attn = np.load(io.BytesIO(get_bytes(cat)))
+
+        return {
+            "uid": Path(stem).name,
+            "meta": meta,
+            "phrase_ids": phr_ids,
+            "phrase_attn": phr_attn,
+            "context_ids": ctx_ids,
+            "context_attn": ctx_attn,
+        }
+
+# --- compute phrase/context time ranges from meta + source MIDI ---
+def compute_times_from_meta(meta: dict):
+    src_path = meta["src_path"]
+    start_bar = int(meta["start_bar"])
+    k = int(meta["k_bars"])
+    phrase_bars = int(meta["phrase_bars"])
+
+    pm = pretty_midi.PrettyMIDI(src_path)
+    downbeats = load_downbeats(pm)
+
+    # context covers bars [start_bar - k, start_bar)
+    ctx_start_t = float(downbeats[start_bar - k])
+    ctx_end_t   = float(downbeats[start_bar])
+
+    # phrase covers bars [start_bar, start_bar + phrase_bars)
+    phr_start_t = float(downbeats[start_bar])
+    phr_end_t   = float(downbeats[start_bar + phrase_bars])
+
+    return dict(
+        src_path=src_path,
+        ctx=(ctx_start_t, ctx_end_t),
+        phrase=(phr_start_t, phr_end_t),
+        n_downbeats=len(downbeats),
+    )
+def list_source_midis(shard_path: Path):
+    srcs = []
+    with tarfile.open(shard_path, "r:*") as tf:
+        metas = [m for m in tf.getmembers() if m.name.endswith(".meta.json")]
+        for m in metas:
+            fobj = tf.extractfile(m)
+            if fobj is None:
+                continue
+            meta = json.load(fobj)
+            srcs.append(meta["src_path"])
+    return srcs
 
 
-mf = "mini_midis/121437_1.mid"
+shard = first_shard(SHARDS_DIR)
+item = read_one_item_from_shard(shard)
+print(f"item: {item}")
+exit()
+srcs = list_source_midis(shard)
+print(f"Total items in shard: {len(srcs)}")
+print(f"Unique source MIDIs: {len(set(srcs))}")
 
-md = MidiDict.from_midi(mid_path=mf)
-print(len(md.note_msgs))
-print(md.note_msgs[:10])
+
+times = compute_times_from_meta(item["meta"])
+
+print("UID:", item["uid"])
+print("Source MIDI:", times["src_path"])
+print("Phrase ids len / attn len:", len(item["phrase_ids"]), len(item["phrase_attn"]))
+print("Context ids len / attn len:", len(item["context_ids"]), len(item["context_attn"]))
+print("Phrase time window [s]:", times["phrase"])
+print("Context time window [s]:", times["ctx"])
+
+

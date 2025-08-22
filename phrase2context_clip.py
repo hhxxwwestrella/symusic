@@ -611,6 +611,12 @@ def _aria_forward(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     Call the Aria embedding backbone regardless of signature differences across revisions.
     Tries several common call signatures and returns a tensor of shape (B, L, D) or (B, D).
     """
+    # Allowing several types as input, and changing the type of the
+    # output depending on the input, is generally a bad idea, because
+    # it puts responsibility on the caller to try all the possible
+    # outputs, which propagates complexity. If you see ChatGPT doing
+    # this, you should try to figure out exactly what type you need.
+    
     # Most likely: positional args (input_ids, attention_mask)
     try:
         out = model(input_ids, attention_mask)
